@@ -4027,8 +4027,8 @@ static bool prog_contains_insn(const struct bpf_program *prog, size_t insn_idx)
 	       insn_idx < prog->sec_insn_off + prog->sec_insn_cnt;
 }
 
-static struct bpf_program *find_prog_by_sec_insn(const struct bpf_object *obj,
-						 size_t sec_idx, size_t insn_idx)
+struct bpf_program *find_prog_by_sec_insn(const struct bpf_object *obj,
+					  size_t sec_idx, size_t insn_idx)
 {
 	int l = 0, r = obj->nr_programs - 1, m;
 	struct bpf_program *prog;
@@ -5498,11 +5498,13 @@ static int record_relo_core(struct bpf_program *prog,
 	return 0;
 }
 
-static int bpf_core_apply_relo(struct bpf_program *prog,
-			       const struct bpf_core_relo *relo,
-			       int relo_idx,
-			       const struct btf *local_btf,
-			       struct hashmap *cand_cache)
+int bpf_core_calc_relo_res(struct bpf_program *prog,
+			   const struct bpf_core_relo *relo,
+			   int relo_idx,
+			   const struct btf *local_btf,
+			   struct hashmap *cand_cache,
+			   struct bpf_core_relo_res *targ_res,
+			   struct bpf_core_spec *targ_spec)
 {
 	struct bpf_core_spec specs_scratch[3] = {};
 	const void *type_key = u32_as_hash_key(relo->type_id);
@@ -5511,20 +5513,7 @@ static int bpf_core_apply_relo(struct bpf_program *prog,
 	const struct btf_type *local_type;
 	const char *local_name;
 	__u32 local_id = relo->type_id;
-	struct bpf_insn *insn;
-	int insn_idx, err;
-
-	if (relo->insn_off % BPF_INSN_SZ)
-		return -EINVAL;
-	insn_idx = relo->insn_off / BPF_INSN_SZ;
-	/* adjust insn_idx from section frame of reference to the local
-	 * program's frame of reference; (sub-)program code is not yet
-	 * relocated, so it's enough to just subtract in-section offset
-	 */
-	insn_idx = insn_idx - prog->sec_insn_off;
-	if (insn_idx >= prog->insns_cnt)
-		return -EINVAL;
-	insn = &prog->insns[insn_idx];
+	int err;
 
 	local_type = btf__type_by_id(local_btf, local_id);
 	if (!local_type)
@@ -5536,6 +5525,7 @@ static int bpf_core_apply_relo(struct bpf_program *prog,
 
 	if (prog->obj->gen_loader) {
 		const char *spec_str = btf__name_by_offset(local_btf, relo->access_str_off);
+		int insn_idx = relo->insn_off / BPF_INSN_SZ;
 
 		pr_debug("record_relo_core: prog %td insn[%d] %s %s %s final insn_idx %d\n",
 			prog - prog->obj->programs, relo->insn_off / 8,
@@ -5559,19 +5549,44 @@ static int bpf_core_apply_relo(struct bpf_program *prog,
 		}
 	}
 
-	return bpf_core_apply_relo_insn(prog_name, insn, insn_idx, relo,
-					relo_idx, local_btf, cands, specs_scratch);
+	err = bpf_core_calc_relo_insn(prog_name, relo, relo_idx, local_btf, cands,
+				      specs_scratch, targ_res);
+	if (err)
+		return err;
+
+	if (targ_spec)
+		*targ_spec = specs_scratch[2];
+	return 0;
+}
+
+struct hashmap *bpf_core_create_cand_cache(void)
+{
+	return hashmap__new(bpf_core_hash_fn, bpf_core_equal_fn, NULL);
+}
+
+void bpf_core_free_cand_cache(struct hashmap *cand_cache)
+{
+	struct hashmap_entry *entry;
+	int i;
+
+	if (!IS_ERR_OR_NULL(cand_cache)) {
+		hashmap__for_each_entry(cand_cache, entry, i) {
+			bpf_core_free_cands(entry->value);
+		}
+		hashmap__free(cand_cache);
+	}
 }
 
 static int
 bpf_object__relocate_core(struct bpf_object *obj, const char *targ_btf_path)
 {
 	const struct btf_ext_info_sec *sec;
+	struct bpf_core_relo_res targ_res;
 	const struct bpf_core_relo *rec;
 	const struct btf_ext_info *seg;
-	struct hashmap_entry *entry;
 	struct hashmap *cand_cache = NULL;
 	struct bpf_program *prog;
+	struct bpf_insn *insn;
 	const char *sec_name;
 	int i, err = 0, insn_idx, sec_idx;
 
@@ -5587,7 +5602,7 @@ bpf_object__relocate_core(struct bpf_object *obj, const char *targ_btf_path)
 		}
 	}
 
-	cand_cache = hashmap__new(bpf_core_hash_fn, bpf_core_equal_fn, NULL);
+	cand_cache = bpf_core_create_cand_cache();
 	if (IS_ERR(cand_cache)) {
 		err = PTR_ERR(cand_cache);
 		goto out;
@@ -5636,10 +5651,35 @@ bpf_object__relocate_core(struct bpf_object *obj, const char *targ_btf_path)
 			if (!prog->load)
 				continue;
 
-			err = bpf_core_apply_relo(prog, rec, i, obj->btf, cand_cache);
+			err = bpf_core_calc_relo_res(prog, rec, i, obj->btf, cand_cache, &targ_res,
+						     NULL);
 			if (err) {
 				pr_warn("prog '%s': relo #%d: failed to relocate: %d\n",
 					prog->name, i, err);
+				goto out;
+			}
+
+			// TODO: mauricio
+			if (prog->obj->gen_loader)
+				return err;
+
+
+			if (rec->insn_off % BPF_INSN_SZ)
+				return -EINVAL;
+			insn_idx = rec->insn_off / BPF_INSN_SZ;
+			/* adjust insn_idx from section frame of reference to the local
+			 * program's frame of reference; (sub-)program code is not yet
+			 * relocated, so it's enough to just subtract in-section offset
+			 */
+			insn_idx = insn_idx - prog->sec_insn_off;
+			if (insn_idx >= prog->insns_cnt)
+				return -EINVAL;
+			insn = &prog->insns[insn_idx];
+
+			err = bpf_core_patch_insn(prog->name, insn, insn_idx, rec, i, &targ_res);
+			if (err) {
+				pr_warn("prog '%s': relo #%d: failed to patch insn #%u: %d\n",
+					prog->name, i, insn_idx, err);
 				goto out;
 			}
 		}
@@ -5650,12 +5690,8 @@ out:
 	btf__free(obj->btf_vmlinux_override);
 	obj->btf_vmlinux_override = NULL;
 
-	if (!IS_ERR_OR_NULL(cand_cache)) {
-		hashmap__for_each_entry(cand_cache, entry, i) {
-			bpf_core_free_cands(entry->value);
-		}
-		hashmap__free(cand_cache);
-	}
+	bpf_core_free_cand_cache(cand_cache);
+
 	return err;
 }
 
@@ -8180,6 +8216,11 @@ struct btf *bpf_object__btf(const struct bpf_object *obj)
 	return obj ? obj->btf : NULL;
 }
 
+struct btf_ext *bpf_object__btf_ext(const struct bpf_object *obj)
+{
+	return obj ? obj->btf_ext : NULL;
+}
+
 int bpf_object__btf_fd(const struct bpf_object *obj)
 {
 	return obj->btf ? btf__fd(obj->btf) : -1;
@@ -8271,6 +8312,20 @@ bpf_object__next_program(const struct bpf_object *obj, struct bpf_program *prev)
 	return prog;
 }
 
+size_t bpf_object__get_nr_programs(const struct bpf_object *obj)
+{
+	return obj->nr_programs;
+}
+
+struct bpf_program *
+bpf_object__get_program(const struct bpf_object *obj, unsigned int i)
+{
+	if (i >= obj->nr_programs)
+		return NULL;
+
+	return &obj->programs[i];
+}
+
 struct bpf_program *
 bpf_program__prev(struct bpf_program *next, const struct bpf_object *obj)
 {
@@ -8348,6 +8403,11 @@ int bpf_program__set_autoload(struct bpf_program *prog, bool autoload)
 
 	prog->load = autoload;
 	return 0;
+}
+
+int bpf_program__sec_idx(const struct bpf_program *prog)
+{
+	return prog->sec_idx;
 }
 
 static int bpf_program_nth_fd(const struct bpf_program *prog, int n);
@@ -11768,4 +11828,9 @@ void bpf_object__destroy_skeleton(struct bpf_object_skeleton *s)
 	free(s->maps);
 	free(s->progs);
 	free(s);
+}
+
+void bpf_object_set_vmlinux_override(struct bpf_object *obj, struct btf *btf)
+{
+	obj->btf_vmlinux_override = btf;
 }
