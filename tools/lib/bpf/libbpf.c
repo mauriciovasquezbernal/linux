@@ -5659,6 +5659,11 @@ bpf_object__relocate_core(struct bpf_object *obj, const char *targ_btf_path)
 				goto out;
 			}
 
+			// TODO: mauricio
+			if (prog->obj->gen_loader)
+				return err;
+
+
 			if (rec->insn_off % BPF_INSN_SZ)
 				return -EINVAL;
 			insn_idx = rec->insn_off / BPF_INSN_SZ;
