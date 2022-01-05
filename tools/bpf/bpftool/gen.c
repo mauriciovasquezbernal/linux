@@ -1096,6 +1096,28 @@ static int do_help(int argc, char **argv)
 	return 0;
 }
 
+static int btf_save_raw(const struct btf *btf, const char *path)
+{
+	const void *data;
+	FILE *f = NULL;
+	__u32 data_sz;
+	int err = 0;
+
+	data = btf__raw_data(btf, &data_sz);
+	if (!data)
+		return -ENOMEM;
+
+	f = fopen(path, "wb");
+	if (!f)
+		return -errno;
+
+	if (fwrite(data, 1, data_sz, f) != data_sz)
+		err = -errno;
+
+	fclose(f);
+	return err;
+}
+
 /* Create BTF file for a set of BPF objects */
 static int btfgen(const char *src_btf, const char *dst_btf, const char *objspaths[])
 {
