@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #endif
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/err.h>
@@ -1087,6 +1088,7 @@ static int do_help(int argc, char **argv)
 	fprintf(stderr,
 		"Usage: %1$s %2$s object OUTPUT_FILE INPUT_FILE [INPUT_FILE...]\n"
 		"       %1$s %2$s skeleton FILE [name OBJECT_NAME]\n"
+		"       %1$s %2$s min_core_btf INPUT OUTPUT OBJECT [OBJECT...]\n"
 		"       %1$s %2$s help\n"
 		"\n"
 		"       " HELP_SPEC_OPTIONS " |\n"
@@ -1097,10 +1099,112 @@ static int do_help(int argc, char **argv)
 	return 0;
 }
 
+/* Create BTF file for a set of BPF objects */
+static int minimize_btf(const char *src_btf, const char *dst_btf, const char *objspaths[])
+{
+	return -EOPNOTSUPP;
+}
+
+static int do_min_core_btf(int argc, char **argv)
+{
+	char src_btf_path[PATH_MAX], dst_btf_path[PATH_MAX];
+	bool input_is_file, output_is_file = true;
+	const char *input, *output;
+	const char **objs = NULL;
+	struct dirent *dir;
+	struct stat st;
+	DIR *d = NULL;
+	int i, err;
+
+	if (!REQ_ARGS(3)) {
+		usage();
+		return -1;
+	}
+
+	input = GET_ARG();
+	if (stat(input, &st) < 0) {
+		p_err("failed to stat %s: %s", input, strerror(errno));
+		return -errno;
+	}
+
+	if ((st.st_mode & S_IFMT) != S_IFDIR && (st.st_mode & S_IFMT) != S_IFREG) {
+		p_err("file type not valid: %s", input);
+		return -EINVAL;
+	}
+
+	input_is_file = (st.st_mode & S_IFMT) == S_IFREG;
+
+	output = GET_ARG();
+	if (stat(output, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR)
+		output_is_file = false;
+
+	objs = (const char **) calloc(argc + 1, sizeof(*objs));
+	if (!objs) {
+		p_err("failed to allocate array for object names");
+		return -ENOMEM;
+	}
+
+	i = 0;
+	while (argc)
+		objs[i++] = GET_ARG();
+
+	/* single BTF file */
+	if (input_is_file) {
+		p_info("Processing source BTF file: %s", input);
+
+		if (output_is_file) {
+			err = minimize_btf(input, output, objs);
+			goto out;
+		}
+		snprintf(dst_btf_path, sizeof(dst_btf_path), "%s/%s", output,
+			 basename(input));
+		err = minimize_btf(input, dst_btf_path, objs);
+		goto out;
+	}
+
+	if (output_is_file) {
+		p_err("can't have just one file as output");
+		err = -EINVAL;
+		goto out;
+	}
+
+	/* directory with BTF files */
+	d = opendir(input);
+	if (!d) {
+		p_err("error opening input dir: %s", strerror(errno));
+		err = -errno;
+		goto out;
+	}
+
+	while ((dir = readdir(d)) != NULL) {
+		if (dir->d_type != DT_REG)
+			continue;
+
+		if (strncmp(dir->d_name + strlen(dir->d_name) - 4, ".btf", 4))
+			continue;
+
+		snprintf(src_btf_path, sizeof(src_btf_path), "%s%s", input, dir->d_name);
+		snprintf(dst_btf_path, sizeof(dst_btf_path), "%s%s", output, dir->d_name);
+
+		p_info("Processing source BTF file: %s", src_btf_path);
+
+		err = minimize_btf(src_btf_path, dst_btf_path, objs);
+		if (err)
+			goto out;
+	}
+
+out:
+	free(objs);
+	if (d)
+		closedir(d);
+	return err;
+}
+
 static const struct cmd cmds[] = {
-	{ "object",	do_object },
-	{ "skeleton",	do_skeleton },
-	{ "help",	do_help },
+	{ "object",		do_object },
+	{ "skeleton",		do_skeleton },
+	{ "min_core_btf",	do_min_core_btf},
+	{ "help",		do_help },
 	{ 0 }
 };
 
