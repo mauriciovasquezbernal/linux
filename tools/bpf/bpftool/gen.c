@@ -1554,10 +1554,150 @@ out:
 	return err;
 }
 
+static unsigned int btfgen_get_id(struct hashmap *ids, unsigned int old)
+{
+	uintptr_t new = 0;
+
+	/* deal with BTF_KIND_VOID */
+	if (old == 0)
+		return 0;
+
+	if (!hashmap__find(ids, uint_as_hash_key(old), (void **)&new)) {
+		/* return id for void as it's possible that the ID we're looking for is
+		 * the type of a pointer that we're not adding.
+		 */
+		return 0;
+	}
+
+	return (unsigned int)(uintptr_t)new;
+}
+
+static int btfgen_add_id(struct hashmap *ids, unsigned int old, unsigned int new)
+{
+	return hashmap__add(ids, uint_as_hash_key(old), uint_as_hash_key(new));
+}
+
+static int btfgen_remap_id(__u32 *type_id, void *ctx)
+{
+	struct hashmap *ids = ctx;
+
+	*type_id = btfgen_get_id(ids, *type_id);
+
+	return 0;
+}
+
 /* Generate BTF from relocation information previously recorded */
 static struct btf *btfgen_get_btf(struct btfgen_info *info)
 {
-	return ERR_PTR(-EOPNOTSUPP);
+	struct hashmap_entry *entry;
+	struct btf *btf_new = NULL;
+	struct hashmap *ids = NULL;
+	unsigned int i;
+	size_t bkt;
+	int err = 0;
+
+	btf_new = btf__new_empty();
+	if (!btf_new) {
+		err = -errno;
+		goto err_out;
+	}
+
+	ids = hashmap__new(btfgen_hash_fn, btfgen_equal_fn, NULL);
+	if (IS_ERR(ids)) {
+		err = PTR_ERR(ids);
+		goto err_out;
+	}
+
+	/* first pass: add all types and add their new ids to the ids map */
+	hashmap__for_each_entry(info->types, entry, bkt) {
+		struct btfgen_type *btfgen_type = entry->value;
+		const struct btf_type *btf_type = btfgen_type->type;
+		int new_id;
+
+		/* we're adding BTF_KIND_VOID to the list but it can't be added to
+		 * the generated BTF object, hence we skip it here.
+		 */
+		if (btfgen_type->id == 0)
+			continue;
+
+		/* add members for struct and union */
+		if (btf_is_struct(btf_type) || btf_is_union(btf_type)) {
+			struct hashmap_entry *member_entry;
+			struct btf_type *btf_type_cpy;
+			int nmembers, index;
+			size_t new_size;
+
+			nmembers = btfgen_type->members ? hashmap__size(btfgen_type->members) : 0;
+			new_size = sizeof(struct btf_type) + nmembers * sizeof(struct btf_member);
+
+			btf_type_cpy = malloc(new_size);
+			if (!btf_type_cpy)
+				goto err_out;
+
+			/* copy btf type */
+			btf_type_cpy->name_off = btf_type->name_off;
+			btf_type_cpy->info = btf_type->info;
+			btf_type_cpy->type = btf_type->type; // type or size
+
+			/* copy only members that are needed */
+			index = 0;
+			if (nmembers > 0) {
+				size_t bkt2;
+
+				hashmap__for_each_entry(btfgen_type->members, member_entry, bkt2) {
+					struct btfgen_member *btfgen_member;
+					struct btf_member *btf_member_src, *btf_member_dst;
+
+					btfgen_member = member_entry->value;
+
+					btf_member_src = btf_members(btf_type) + btfgen_member->idx;
+					btf_member_dst = btf_members(btf_type_cpy) + index;
+
+					btf_member_dst->name_off = btf_member_src->name_off;
+					btf_member_dst->type = btf_member_src->type;
+					btf_member_dst->offset = btf_member_src->offset;
+
+					index++;
+				}
+			}
+
+			/* set new vlen */
+			btf_type_cpy->info = btf_type_info(btf_kind(btf_type_cpy), nmembers,
+							   btf_kflag(btf_type_cpy));
+
+			err = btf__add_type(btf_new, info->src_btf, btf_type_cpy);
+			free(btf_type_cpy);
+		} else {
+			err = btf__add_type(btf_new, info->src_btf, btf_type);
+		}
+
+		if (err < 0)
+			goto err_out;
+
+		new_id = err;
+
+		/* add ID mapping */
+		err = btfgen_add_id(ids, btfgen_type->id, new_id);
+		if (err)
+			goto err_out;
+	}
+
+	/* second pass: fix up type ids */
+	for (i = 1; i < btf__type_cnt(btf_new); i++) {
+		struct btf_type *btf_type = (struct btf_type *) btf__type_by_id(btf_new, i);
+		err = btf_type_visit_type_ids(btf_type, btfgen_remap_id, ids);
+		if (err)
+			goto err_out;
+	}
+
+	hashmap__free(ids);
+	return btf_new;
+
+err_out:
+	btf__free(btf_new);
+	hashmap__free(ids);
+	errno = -err;
+	return NULL;
 }
 
 /* Create BTF file for a set of BPF objects.
