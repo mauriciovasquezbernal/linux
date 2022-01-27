@@ -25,6 +25,7 @@ GEN COMMANDS
 
 |	**bpftool** **gen object** *OUTPUT_FILE* *INPUT_FILE* [*INPUT_FILE*...]
 |	**bpftool** **gen skeleton** *FILE* [**name** *OBJECT_NAME*]
+|	**bpftool** **gen min_core_btf** *INPUT* *OUTPUT* *OBJECT* [*OBJECT*...]
 |	**bpftool** **gen help**
 
 DESCRIPTION
@@ -149,6 +150,24 @@ DESCRIPTION
 		  (non-read-only) data from userspace, with same simplicity
 		  as for BPF side.
 
+	**bpftool** **gen min_core_btf** *INPUT* *OUTPUT* *OBJECT(S)*
+		  Given one, or multiple, eBPF *OBJECT* files, generate a
+		  smaller BTF file, in the *OUTPUT* directory, to each existing
+		  BTF files in the *INPUT* directory, using the same name.
+
+		  If *INPUT* is a file, then the result BTF will be saved as a
+		  single file, with the same name, in *OUTPUT* directory.
+
+		  Generated BTF files will only contain the BTF types used by
+		  the given eBPF objects. Idea behind this is simple: Full
+		  external BTF files are big. This allows customized external
+		  BTF files generation and maximizes eBPF portability (CO-RE).
+
+		  This feature allows a particular eBPF project to embed
+		  customized BTF files in order to support older kernels,
+		  allowing code to be portable among kernels that don't support
+		  embedded BTF files but still support eBPF.
+
 	**bpftool gen help**
 		  Print short help message.
 
@@ -215,7 +234,9 @@ This is example BPF application with two BPF programs and a mix of BPF maps
 and global variables. Source code is split across two source code files.
 
 **$ clang -target bpf -g example1.bpf.c -o example1.bpf.o**
+
 **$ clang -target bpf -g example2.bpf.c -o example2.bpf.o**
+
 **$ bpftool gen object example.bpf.o example1.bpf.o example2.bpf.o**
 
 This set of commands compiles *example1.bpf.c* and *example2.bpf.c*
@@ -329,3 +350,67 @@ BPF ELF object file *example.bpf.o*.
   my_static_var: 7
 
 This is a stripped-out version of skeleton generated for above example code.
+
+*MIN_CORE_BTF*
+
+::
+
+  $ bpftool btf dump file ./input/5.4.0-91-generic.btf format raw
+
+  [1] INT 'long unsigned int' size=8 bits_offset=0 nr_bits=64 encoding=(none)
+  [2] CONST '(anon)' type_id=1
+  [3] VOLATILE '(anon)' type_id=1
+  [4] ARRAY '(anon)' type_id=1 index_type_id=21 nr_elems=2
+  [5] PTR '(anon)' type_id=8
+  [6] CONST '(anon)' type_id=5
+  [7] INT 'char' size=1 bits_offset=0 nr_bits=8 encoding=(none)
+  [8] CONST '(anon)' type_id=7
+  [9] INT 'unsigned int' size=4 bits_offset=0 nr_bits=32 encoding=(none)
+  <long output>
+
+  $ bpftool btf dump file ./one.bpf.o format raw
+
+  [1] PTR '(anon)' type_id=2
+  [2] STRUCT 'trace_event_raw_sys_enter' size=64 vlen=4
+        'ent' type_id=3 bits_offset=0
+        'id' type_id=7 bits_offset=64
+        'args' type_id=9 bits_offset=128
+        '__data' type_id=12 bits_offset=512
+  [3] STRUCT 'trace_entry' size=8 vlen=4
+        'type' type_id=4 bits_offset=0
+        'flags' type_id=5 bits_offset=16
+        'preempt_count' type_id=5 bits_offset=24
+  <long output>
+
+  $ bpftool gen min_core_btf ./input/ ./output ./one.bpf.o
+
+  $ bpftool btf dump file ./output/5.4.0-91-generic.btf format raw
+
+  [1] TYPEDEF 'pid_t' type_id=6
+  [2] STRUCT 'trace_event_raw_sys_enter' size=64 vlen=1
+        'args' type_id=4 bits_offset=128
+  [3] STRUCT 'task_struct' size=9216 vlen=2
+        'pid' type_id=1 bits_offset=17920
+        'real_parent' type_id=7 bits_offset=18048
+  [4] ARRAY '(anon)' type_id=5 index_type_id=8 nr_elems=6
+  [5] INT 'long unsigned int' size=8 bits_offset=0 nr_bits=64 encoding=(none)
+  [6] TYPEDEF '__kernel_pid_t' type_id=8
+  [7] PTR '(anon)' type_id=3
+  [8] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED
+  <end>
+
+  Now, one may use ./output/5.4.0-91-generic.btf generated file as an external
+  BTF file fed to libbpf during eBPF object opening:
+
+  struct bpf_object *obj = NULL;
+  struct bpf_object_open_opts openopts = {};
+
+  openopts.sz = sizeof(struct bpf_object_open_opts);
+  openopts.btf_custom_path = strdup("./output/5.4.0-91-generic.btf");
+
+  obj = bpf_object__open_file("./one.bpf.o", &openopts);
+
+  ...
+
+  and allow libbpf to do all needed CO-RE relocations, to "one.bpf.o" object,
+  based on the small external BTF file.
